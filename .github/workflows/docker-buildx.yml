@@ -29,8 +29,7 @@ jobs:
             REGISTRY: ${{ (((github.event.inputs.provider != '' && github.event.inputs.provider) || vars.PROVIDER || 'ghcr') == 'ghcr') && 'ghcr.io' || 'docker.io' }}
             IMAGE:
                 ${{ (((github.event.inputs.provider != '' && github.event.inputs.provider) || vars.PROVIDER || 'ghcr') == 'ghcr')
-                && format('{0}/command-api', github.repository_owner)
-                || format('{0}/command-api', vars.DOCKERHUB_NAMESPACE) }}
+                && format('{0}/command-api', github.repository_owner) || format('{0}/command-api', vars.DOCKERHUB_NAMESPACE) }}
 
         steps:
             - name: Checkout
