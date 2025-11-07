@@ -14,7 +14,7 @@ RUN set -eux; \
 # 复制 go.mod 和 go.sum 文件
 COPY go.mod go.sum ./
 
-ENV GOPROXY=https://goproxy.cn,direct
+# ENV GOPROXY=https://goproxy.cn,direct
 
 # 单独下载依赖，缓存到 GOPATH/pkg/mod 目录中
 RUN go mod download
