@@ -1,4 +1,4 @@
-name: GHCR nightly cleanup (single script)
+name: GHCR nightly cleanup (single script + diagnostics)
 
 on:
   schedule:
@@ -6,20 +6,25 @@ on:
   workflow_dispatch:
     inputs:
       retention_days:
-        description: "临时标签至少保留天数"
+        description: "临时标签至少保留天数（建议 3）"
         type: number
         default: 3
+      debug:
+        description: "开启脚本 set -x（可能打印命令参数，注意脱敏）"
+        type: boolean
+        default: false
 
 permissions:
   packages: write
   contents: read
 
 env:
-  REPO: ${{ github.repository }}        # owner/repo
+  REPO: ${{ github.repository }}                       # owner/repo
   OWNER: ${{ github.repository_owner }}
   KEEP_TAGS: ${{ format('latest {0}', github.event.repository.default_branch || 'main') }}
   RETENTION_DAYS: ${{ (github.event_name == 'workflow_dispatch' && inputs.retention_days) || 3 }}
-  TEMP_TAG_REGEX: '^[0-9a-f]{40}-(amd64|arm64)$'
+  # 更宽松：短/长 SHA 都匹配；若只用 40 位，请改为 ^[0-9a-f]{40}-(amd64|arm64)$
+  TEMP_TAG_REGEX: '^[0-9a-f]{7,40}-(amd64|arm64)$'
 
 jobs:
   cleanup:
@@ -27,8 +32,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DEBUG: ${{ (github.event_name == 'workflow_dispatch' && (inputs.debug && '1' || '0')) || '0' }}
     steps:
-      - uses: actions/checkout@main
+      - uses: actions/checkout@v4
+
       - name: Run cleanup script
         run: |
           chmod +x .github/scripts/ghcr-clean.sh

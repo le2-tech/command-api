@@ -2,14 +2,16 @@
 # GHCR temporary arch-tag cleanup (single-script)
 # 删除命名形如 "<sha>-amd64/arm64" 的临时标签版本，保护 KEEP_TAGS 的多架构 manifest 及其子 digest。
 
-set -Eeuxo pipefail
+set -Eeuo pipefail
+# 如需命令级追踪，设置 env DEBUG=1；注意：涉及 Token 的命令会自动暂时关闭 xtrace
+if [[ "${DEBUG:-0}" == "1" ]]; then set -x; fi
 
 # -------- Config from env --------
 : "${REPO:?missing REPO (owner/repo)}"
 : "${OWNER:?missing OWNER}"
 : "${KEEP_TAGS:?missing KEEP_TAGS}"               # e.g. "latest main"
 : "${RETENTION_DAYS:?missing RETENTION_DAYS}"     # e.g. 3
-: "${TEMP_TAG_REGEX:?missing TEMP_TAG_REGEX}"     # e.g. '^[0-9a-f]{40}-(amd64|arm64)$'
+: "${TEMP_TAG_REGEX:?missing TEMP_TAG_REGEX}"     # e.g. '^[0-9a-f]{7,40}-(amd64|arm64)$'
 AUTH="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 
 if [[ -z "${AUTH}" ]]; then
@@ -17,18 +19,23 @@ if [[ -z "${AUTH}" ]]; then
   exit 1
 fi
 
-# lower-case owner/repo (GHCR 标准)
+# lower-case owner/repo (GHCR 规范)
 owner="${OWNER,,}"
 image="${REPO#*/}"; image="${image,,}"
 repo="${owner}/${image}"
 
 # -------- Build protected digest set (from KEEP_TAGS) --------
 # 获取 GHCR registry bearer token（用来访问 /v2/ manifests）
+# 为避免在调试模式下打印出密钥，这里临时关闭 -x
+prev_xtrace="$(set +o | grep xtrace || true)"
+set +x
 token="$(
   curl -fsSL -u "${GITHUB_ACTOR}:${AUTH}" \
     "https://ghcr.io/token?scope=repository:${repo}:pull" \
   | jq -r .token
 )"
+# 恢复之前的 xtrace 状态
+eval "$prev_xtrace"
 
 prot="$(mktemp)"; : > "$prot"
 accept_index='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
@@ -53,6 +60,7 @@ done
 
 sort -u "$prot" -o "$prot"
 PROTECTED_JSON="$(jq -Rsc 'split("\n")|map(select(length>0))' "$prot")"
+PROTECTED_JSON="${PROTECTED_JSON:-[]}"
 
 # -------- Plan: list deletion candidates --------
 # 组织 or 用户 命名空间
@@ -65,7 +73,7 @@ fi
 
 cutoff="$(date -u -d "${RETENTION_DAYS} days ago" +%s)"
 
-# 先把 API 原始数据保存下来，统计总量（分页合并）
+# 把 API 原始数据保存下来，统计总量（分页合并）
 VERSIONS_LS="$(mktemp)"
 gh api --paginate -H "Accept: application/vnd.github+json" \
   "${base}/packages/container/${image}/versions?per_page=100" > "$VERSIONS_LS"
@@ -73,7 +81,7 @@ gh api --paginate -H "Accept: application/vnd.github+json" \
 RAW_TOTAL="$(jq -s 'map(length) | add // 0' "$VERSIONS_LS")"
 echo "raw_total=${RAW_TOTAL}"
 
-# 如果有数据，打印前 5 条做个示例（便于核对 tags/时间/命名）
+# 如果有数据，打印前 5 条做示例（便于核对 tags/时间/命名）
 if [[ "${RAW_TOTAL}" -gt 0 ]]; then
   echo "::group::sample(5) versions"
   jq -c '.[] | .[] | {id, updated_at, tags:(.metadata.container.tags // [])}' "$VERSIONS_LS" | head -n 5
@@ -102,7 +110,6 @@ IDS_JSON="$(
 COUNT="$(jq 'length' <<< "$IDS_JSON")"
 echo "after_filter=${COUNT}"
 
-
 # -------- Delete --------
 if [[ "$COUNT" -eq 0 ]]; then
   echo "Nothing to delete."
@@ -116,4 +123,5 @@ while IFS= read -r id; do
     "${base}/packages/container/${image}/versions/${id}"
   deleted=$((deleted+1))
 done < <(jq -r '.[]' <<< "$IDS_JSON")
+
 echo "Deleted=$deleted"
