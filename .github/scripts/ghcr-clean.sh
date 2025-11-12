@@ -2,7 +2,7 @@
 # GHCR temporary arch-tag cleanup (single-script)
 # 删除命名形如 "<sha>-amd64/arm64" 的临时标签版本，保护 KEEP_TAGS 的多架构 manifest 及其子 digest。
 
-set -Eeuo pipefail
+set -Eeuxo pipefail
 
 # -------- Config from env --------
 : "${REPO:?missing REPO (owner/repo)}"
