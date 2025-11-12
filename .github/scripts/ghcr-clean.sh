@@ -79,6 +79,8 @@ COMBINED="$(mktemp)"
 # 把多页数组合并成一个数组（关键修正点）
 jq -s 'add' "$VERSIONS_LS" > "$COMBINED"
 
+cat "$COMBINED"
+
 RAW_TOTAL="$(jq 'length' "$COMBINED")"
 echo "raw_total=${RAW_TOTAL}"
 
