@@ -65,28 +65,43 @@ fi
 
 cutoff="$(date -u -d "${RETENTION_DAYS} days ago" +%s)"
 
+# 先把 API 原始数据保存下来，统计总量（分页合并）
+VERSIONS_LS="$(mktemp)"
+gh api --paginate -H "Accept: application/vnd.github+json" \
+  "${base}/packages/container/${image}/versions?per_page=100" > "$VERSIONS_LS"
+
+RAW_TOTAL="$(jq -s 'map(length) | add // 0' "$VERSIONS_LS")"
+echo "raw_total=${RAW_TOTAL}"
+
+# 如果有数据，打印前 5 条做个示例（便于核对 tags/时间/命名）
+if [[ "${RAW_TOTAL}" -gt 0 ]]; then
+  echo "::group::sample(5) versions"
+  jq -c '.[] | .[] | {id, updated_at, tags:(.metadata.container.tags // [])}' "$VERSIONS_LS" | head -n 5
+  echo "::endgroup::"
+fi
+
+# 过滤：临时标签命名 + 过了保留期 + 不在保护集
 IDS_JSON="$(
-  gh api --paginate -H "Accept: application/vnd.github+json" \
-     "${base}/packages/container/${image}/versions?per_page=100" \
-  | jq -r --arg re "${TEMP_TAG_REGEX}" \
-         --argjson prot "${PROTECTED_JSON:-[]}" \
-         --argjson cutoff "$cutoff" '
-      .[] | {
+  jq -r --arg re "${TEMP_TAG_REGEX}" \
+        --argjson prot "${PROTECTED_JSON:-[]}" \
+        --argjson cutoff "$cutoff" '
+    .[] | .[]                                      # 展开分页
+    | {
         id,
         digest: .name,
         updated_at,
         tags: (.metadata.container.tags // [])
       }
-      | select([ .tags[]? | test($re) ] | any)               # 命中临时标签
-      | select(( .updated_at | fromdateiso8601 ) < $cutoff)  # 超过保留期
-      | select(($prot | index(.digest)) | not)               # 不在保护集
-      | .id
-    ' \
-  | jq -Rs 'split("\n")|map(select(length>0))'
+    | select([ .tags[]? | test($re) ] | any)               # 命中临时标签
+    | select(( .updated_at | fromdateiso8601 ) < $cutoff)  # 超过保留期
+    | select(($prot | index(.digest)) | not)               # 不在保护集
+    | .id
+  ' "$VERSIONS_LS" | jq -Rs 'split("\n")|map(select(length>0))'
 )"
 
 COUNT="$(jq 'length' <<< "$IDS_JSON")"
-echo "Candidates: $COUNT"
+echo "after_filter=${COUNT}"
+
 
 # -------- Delete --------
 if [[ "$COUNT" -eq 0 ]]; then
@@ -94,7 +109,6 @@ if [[ "$COUNT" -eq 0 ]]; then
   exit 0
 fi
 
-# 逐个删除候选版本（注意：删除的是“版本=某 digest”，会连带其所有 tag 一起删除）
 deleted=0
 while IFS= read -r id; do
   [[ -n "$id" ]] || continue
@@ -102,5 +116,4 @@ while IFS= read -r id; do
     "${base}/packages/container/${image}/versions/${id}"
   deleted=$((deleted+1))
 done < <(jq -r '.[]' <<< "$IDS_JSON")
-
 echo "Deleted=$deleted"
