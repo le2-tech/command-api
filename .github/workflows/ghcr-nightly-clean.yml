@@ -1,4 +1,4 @@
-name: GHCR nightly cleanup (delete-only, no-jq-install)
+name: GHCR nightly cleanup (single script)
 
 on:
   schedule:
@@ -27,116 +27,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
     steps:
-      - name: Build protected digest set
-        id: protect
-        shell: bash
+      - uses: actions/checkout@main
+      - name: Run cleanup script
         run: |
-          set -Eeuo pipefail
-          owner="${OWNER,,}"
-          image="${REPO#*/}"; image="${image,,}"
-          repo="${owner}/${image}"
-
-          auth="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-          if [ -z "$auth" ]; then
-            echo "ERROR: GITHUB_TOKEN not available" >&2
-            exit 1
-          fi
-
-          token="$(curl -fsSL -u "${GITHUB_ACTOR}:${auth}" \
-                   "https://ghcr.io/token?scope=repository:${repo}:pull" \
-                   | jq -r .token)"
-
-          prot="$(mktemp)"; : > "$prot"
-          accept_index='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
-          accept_manifest='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
-
-          for tag in ${KEEP_TAGS}; do
-            # 若为多架构 index，收集子 digest
-            if json=$(curl -fsSL -H "Authorization: Bearer ${token}" \
-                           -H "Accept: ${accept_index}" \
-                           "https://ghcr.io/v2/${repo}/manifests/${tag}" 2>/dev/null); then
-              echo "$json" | jq -r '.manifests[]?.digest' | sed '/^$/d' >> "$prot" || true
-            fi
-            # 保护该 tag 自身 digest（单架构或 index 顶层）
-            head=$(curl -fsSLI -H "Authorization: Bearer ${token}" \
-                            -H "Accept: ${accept_index}, ${accept_manifest}" \
-                            "https://ghcr.io/v2/${repo}/manifests/${tag}" | tr -d '\r')
-            digest=$(printf '%s\n' "$head" | awk -F': ' '/^Docker-Content-Digest:/ {print $2}' | tail -n1)
-            [ -n "$digest" ] && echo "$digest" >> "$prot"
-          done
-
-          sort -u "$prot" -o "$prot"
-          protected_json="$(jq -Rsc 'split("\n")|map(select(length>0))' "$prot")"
-          {
-            echo "protected<<EOF"
-            echo "$protected_json"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Plan
-        id: plan
-        env:
-          PROTECTED: ${{ steps.protect.outputs.protected }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          owner="${OWNER,,}"
-          image="${REPO#*/}"; image="${image,,}"
-
-          # 组织 or 用户命名空间
-          type="$(gh api "/users/${owner}" -q .type)"
-          [ "$type" = "Organization" ] && base="/orgs/${owner}" || base="/users/${owner}"
-
-          cutoff=$(date -u -d "${RETENTION_DAYS} days ago" +%s)
-
-          # 生成候选列表（换行分隔）
-          gh api --paginate -H "Accept: application/vnd.github+json" \
-            "${base}/packages/container/${image}/versions?per_page=100" \
-          | jq -r --arg re "${TEMP_TAG_REGEX}" \
-                 --argjson prot "${PROTECTED:-[]}" \
-                 --argjson cutoff "$cutoff" '
-              .[] | {
-                id,
-                digest: .name,
-                updated_at,
-                tags: (.metadata.container.tags // [])
-              }
-              | select([ .tags[]? | test($re) ] | any)              # 命中临时标签
-              | select( ( .updated_at | fromdateiso8601 ) < $cutoff )# 过了保留期
-              | select( ($prot | index(.digest)) | not )            # 不在保护集
-              | .id
-            ' > ids.txt
-
-          count=$(grep -c . ids.txt || true)
-          ids_json="$(jq -Rs 'split("\n")|map(select(length>0))' ids.txt)"
-
-          echo "count=${count}" >> "$GITHUB_OUTPUT"
-          {
-            echo "ids_json<<EOF"
-            echo "$ids_json"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Delete
-        if: ${{ steps.plan.outputs.count != '0' }}
-        env:
-          IDS_JSON: ${{ steps.plan.outputs.ids_json }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          owner="${OWNER,,}"
-          image="${REPO#*/}"; image="${image,,}"
-          type="$(gh api "/users/${owner}" -q .type)"
-          [ "$type" = "Organization" ] && base="/orgs/${owner}" || base="/users/${owner}"
-
-          mapfile -t IDS < <(jq -r '.[]' <<< "$IDS_JSON")
-          deleted=0
-          for id in "${IDS[@]}"; do
-            [ -n "$id" ] || continue
-            gh api -X DELETE -H "Accept: application/vnd.github+json" \
-              "${base}/packages/container/${image}/versions/${id}"
-            deleted=$((deleted+1))
-          done
-          echo "Deleted=$deleted"
+          chmod +x .github/scripts/ghcr-clean.sh
+          .github/scripts/ghcr-clean.sh
