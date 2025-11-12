@@ -1,14 +1,10 @@
-name: GHCR nightly cleanup (lean, fixed trigger)
+name: GHCR nightly cleanup (delete-only, no-jq-install)
 
 on:
   schedule:
     - cron: "30 18 * * *"  # 每天 JST 03:30（UTC 18:30）
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "只预览不删除"
-        type: boolean
-        default: false
       retention_days:
         description: "临时标签至少保留天数"
         type: number
@@ -23,7 +19,6 @@ env:
   OWNER: ${{ github.repository_owner }}
   KEEP_TAGS: ${{ format('latest {0}', github.event.repository.default_branch || 'main') }}
   RETENTION_DAYS: ${{ (github.event_name == 'workflow_dispatch' && inputs.retention_days) || 3 }}
-  DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false')) || 'false' }}
   TEMP_TAG_REGEX: '^[0-9a-f]{40}-(amd64|arm64)$'
 
 jobs:
@@ -34,7 +29,6 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
-
       - name: Build protected digest set
         id: protect
         shell: bash
@@ -59,11 +53,13 @@ jobs:
           accept_manifest='application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
 
           for tag in ${KEEP_TAGS}; do
+            # 若为多架构 index，收集子 digest
             if json=$(curl -fsSL -H "Authorization: Bearer ${token}" \
                            -H "Accept: ${accept_index}" \
                            "https://ghcr.io/v2/${repo}/manifests/${tag}" 2>/dev/null); then
               echo "$json" | jq -r '.manifests[]?.digest' | sed '/^$/d' >> "$prot" || true
             fi
+            # 保护该 tag 自身 digest（单架构或 index 顶层）
             head=$(curl -fsSLI -H "Authorization: Bearer ${token}" \
                             -H "Accept: ${accept_index}, ${accept_manifest}" \
                             "https://ghcr.io/v2/${repo}/manifests/${tag}" | tr -d '\r')
@@ -88,10 +84,14 @@ jobs:
           set -Eeuo pipefail
           owner="${OWNER,,}"
           image="${REPO#*/}"; image="${image,,}"
+
+          # 组织 or 用户命名空间
           type="$(gh api "/users/${owner}" -q .type)"
           [ "$type" = "Organization" ] && base="/orgs/${owner}" || base="/users/${owner}"
+
           cutoff=$(date -u -d "${RETENTION_DAYS} days ago" +%s)
 
+          # 生成候选列表（换行分隔）
           gh api --paginate -H "Accept: application/vnd.github+json" \
             "${base}/packages/container/${image}/versions?per_page=100" \
           | jq -r --arg re "${TEMP_TAG_REGEX}" \
@@ -103,24 +103,26 @@ jobs:
                 updated_at,
                 tags: (.metadata.container.tags // [])
               }
-              | select([ .tags[]? | test($re) ] | any)
-              | select( ( .updated_at | fromdateiso8601 ) < $cutoff )
-              | select( ($prot | index(.digest)) | not )
+              | select([ .tags[]? | test($re) ] | any)              # 命中临时标签
+              | select( ( .updated_at | fromdateiso8601 ) < $cutoff )# 过了保留期
+              | select( ($prot | index(.digest)) | not )            # 不在保护集
               | .id
             ' > ids.txt
 
           count=$(grep -c . ids.txt || true)
+          ids_json="$(jq -Rs 'split("\n")|map(select(length>0))' ids.txt)"
+
           echo "count=${count}" >> "$GITHUB_OUTPUT"
           {
-            echo "ids<<EOF"
-            cat ids.txt
+            echo "ids_json<<EOF"
+            echo "$ids_json"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Delete
-        if: ${{ fromJSON(steps.plan.outputs.count) > 0 }}
+        if: ${{ steps.plan.outputs.count != '0' }}
         env:
-          IDS: ${{ steps.plan.outputs.ids }}
+          IDS_JSON: ${{ steps.plan.outputs.ids_json }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -129,15 +131,12 @@ jobs:
           type="$(gh api "/users/${owner}" -q .type)"
           [ "$type" = "Organization" ] && base="/orgs/${owner}" || base="/users/${owner}"
 
+          mapfile -t IDS < <(jq -r '.[]' <<< "$IDS_JSON")
           deleted=0
-          while read -r id; do
+          for id in "${IDS[@]}"; do
             [ -n "$id" ] || continue
-            if [ "$DRY_RUN" = "true" ]; then
-              echo "DRY_RUN: would delete $id"
-              continue
-            fi
             gh api -X DELETE -H "Accept: application/vnd.github+json" \
               "${base}/packages/container/${image}/versions/${id}"
             deleted=$((deleted+1))
-          done <<< "$IDS"
+          done
           echo "Deleted=$deleted"
