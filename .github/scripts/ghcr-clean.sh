@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# GHCR temporary arch-tag cleanup (single-script)
+# GHCR temporary arch-tag cleanup (single-script, fixed pagination handling)
 # 删除命名形如 "<sha>-amd64/arm64" 的临时标签版本，保护 KEEP_TAGS 的多架构 manifest 及其子 digest。
 
 set -Eeuo pipefail
-# 如需命令级追踪，设置 env DEBUG=1；注意：涉及 Token 的命令会自动暂时关闭 xtrace
+# 如需命令级追踪，workflow 可设置 DEBUG=1；为避免泄露 Token，取 token 时会临时关闭 xtrace
 if [[ "${DEBUG:-0}" == "1" ]]; then set -x; fi
 
 # -------- Config from env --------
@@ -25,16 +25,13 @@ image="${REPO#*/}"; image="${image,,}"
 repo="${owner}/${image}"
 
 # -------- Build protected digest set (from KEEP_TAGS) --------
-# 获取 GHCR registry bearer token（用来访问 /v2/ manifests）
-# 为避免在调试模式下打印出密钥，这里临时关闭 -x
-prev_xtrace="$(set +o | grep xtrace || true)"
-set +x
+# 获取 GHCR registry bearer token（访问 /v2/ manifests）
+prev_xtrace="$(set +o | grep xtrace || true)"; set +x
 token="$(
   curl -fsSL -u "${GITHUB_ACTOR}:${AUTH}" \
     "https://ghcr.io/token?scope=repository:${repo}:pull" \
   | jq -r .token
 )"
-# 恢复之前的 xtrace 状态
 eval "$prev_xtrace"
 
 prot="$(mktemp)"; : > "$prot"
@@ -73,18 +70,22 @@ fi
 
 cutoff="$(date -u -d "${RETENTION_DAYS} days ago" +%s)"
 
-# 把 API 原始数据保存下来，统计总量（分页合并）
+# 拉取分页结果 -> 保存到文件 -> 合并为单一数组
 VERSIONS_LS="$(mktemp)"
 gh api --paginate -H "Accept: application/vnd.github+json" \
   "${base}/packages/container/${image}/versions?per_page=100" > "$VERSIONS_LS"
 
-RAW_TOTAL="$(jq -s 'map(length) | add // 0' "$VERSIONS_LS")"
+COMBINED="$(mktemp)"
+# 把多页数组合并成一个数组（关键修正点）
+jq -s 'add' "$VERSIONS_LS" > "$COMBINED"
+
+RAW_TOTAL="$(jq 'length' "$COMBINED")"
 echo "raw_total=${RAW_TOTAL}"
 
 # 如果有数据，打印前 5 条做示例（便于核对 tags/时间/命名）
 if [[ "${RAW_TOTAL}" -gt 0 ]]; then
   echo "::group::sample(5) versions"
-  jq -c '.[] | .[] | {id, updated_at, tags:(.metadata.container.tags // [])}' "$VERSIONS_LS" | head -n 5
+  jq -c '.[0:5] | .[] | {id, updated_at, tags:(.metadata.container.tags // [])}' "$COMBINED"
   echo "::endgroup::"
 fi
 
@@ -93,7 +94,7 @@ IDS_JSON="$(
   jq -r --arg re "${TEMP_TAG_REGEX}" \
         --argjson prot "${PROTECTED_JSON:-[]}" \
         --argjson cutoff "$cutoff" '
-    .[] | .[]                                      # 展开分页
+    .[]
     | {
         id,
         digest: .name,
@@ -104,7 +105,7 @@ IDS_JSON="$(
     | select(( .updated_at | fromdateiso8601 ) < $cutoff)  # 超过保留期
     | select(($prot | index(.digest)) | not)               # 不在保护集
     | .id
-  ' "$VERSIONS_LS" | jq -Rs 'split("\n")|map(select(length>0))'
+  ' "$COMBINED" | jq -Rs 'split("\n")|map(select(length>0))'
 )"
 
 COUNT="$(jq 'length' <<< "$IDS_JSON")"
