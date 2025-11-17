@@ -5,6 +5,13 @@ FROM golang:latest AS builder
 # 设置工作目录
 WORKDIR /app
 
+ARG APP_ENV=prod
+
+RUN set -eux; \
+  if [ "${APP_ENV:-}" = "dev" ]; then \
+  sed -i "s|http://deb.debian.org|http://mirrors.aliyun.com|g" /etc/apt/sources.list.d/debian.sources; \
+  fi
+
 # 安装依赖工具
 RUN set -eux; \
     apt-get update ; \
