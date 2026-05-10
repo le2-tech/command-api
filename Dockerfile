@@ -1,15 +1,16 @@
 
 # 构建阶段
-FROM golang:latest AS builder
+ARG IMAGE_MIRROR
+FROM ${IMAGE_MIRROR}golang:latest AS builder
 
 # 设置工作目录
 WORKDIR /app
 
-ARG APP_ENV=prod
+ARG APT_REPOSITORY
 
 RUN set -eux; \
-  if [ "${APP_ENV:-}" = "dev" ]; then \
-  sed -i "s|http://deb.debian.org|http://mirrors.aliyun.com|g" /etc/apt/sources.list.d/debian.sources; \
+  if [ -n "${APT_REPOSITORY:-}" ]; then \
+    sed -i "s|http://deb.debian.org|${APT_REPOSITORY}|g" /etc/apt/sources.list.d/debian.sources; \
   fi
 
 # 安装依赖工具
@@ -21,7 +22,8 @@ RUN set -eux; \
 # 复制 go.mod 和 go.sum 文件
 COPY go.mod go.sum ./
 
-# ENV GOPROXY=https://goproxy.cn,direct
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY}
 
 # 单独下载依赖，缓存到 GOPATH/pkg/mod 目录中
 RUN go mod download
@@ -34,7 +36,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"
 
 # 最终运行阶段
-FROM alpine:latest
+FROM ${IMAGE_MIRROR}alpine:latest
 
 # 创建工作目录
 WORKDIR /dist

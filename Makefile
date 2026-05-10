@@ -1,5 +1,7 @@
+-include .env
+-include .env.${APP_ENV}
 
-.PHONY: 
+.PHONY: build build0 docker-build
 .DEFAULT_GOAL := build
 tag := command-api
 
@@ -16,3 +18,10 @@ build:
 	#upx --best --lzma --force-macos command-api
 	ls -lh command-api
 	file command-api
+
+docker-build:
+	docker build --no-cache \
+		--build-arg IMAGE_MIRROR=$(IMAGE_MIRROR) \
+		--build-arg APT_REPOSITORY=$(APT_REPOSITORY) \
+		--build-arg GOPROXY=$(GOPROXY) \
+		-t $(tag) .
