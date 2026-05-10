@@ -1,71 +1,147 @@
-name: Build and Push Docker Image
+name: Build & Push Docker image (GHCR, hosted runners, temp-tags manifest)
 
 on:
-  #  push:
-  #    branches: [ "main", "master" ]
-  #    tags: [ "v*", "RELEASE.*" ] # 按需保留你的标签模式
-  #  pull_request:
+  schedule:
+    - cron: "0 0 * * 2,5"
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
   workflow_dispatch:
     inputs:
-      provider:
-        description: "ghcr 或 dockerhub"
-        required: false
-        default: "ghcr"
+      registry:
+        description: "Container registry to push"
+        required: true
+        default: registry.cn-chengdu.aliyuncs.com
+        type: choice
+        options:
+          - ghcr.io
+          - registry.cn-chengdu.aliyuncs.com
+
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: docker-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  REGISTRY: ${{ inputs.registry || 'registry.cn-chengdu.aliyuncs.com' }}
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
-  build:
+  meta:
     runs-on: ubuntu-latest
-    env:
-      PROVIDER: ${{ (github.event.inputs.provider != '' && github.event.inputs.provider) || vars.PROVIDER || 'ghcr' }}
-      REGISTRY: ${{ (((github.event.inputs.provider != '' && github.event.inputs.provider) || vars.PROVIDER || 'ghcr') == 'ghcr') && 'ghcr.io' || 'docker.io' }}
-      IMAGE:
-        ${{ (((github.event.inputs.provider != '' && github.event.inputs.provider) || vars.PROVIDER || 'ghcr') == 'ghcr')
-        && format('{0}/command-api', github.repository_owner) || format('{0}/command-api', vars.DOCKERHUB_NAMESPACE) }}
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@main
-        with:
-          fetch-depth: 0
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@master
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@master
-
-      - uses: docker/login-action@master
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ env.PROVIDER == 'ghcr' && github.actor || vars.DOCKERHUB_NAMESPACE }}
-          password: ${{ env.PROVIDER == 'ghcr' && secrets.GITHUB_TOKEN || secrets.DOCKERHUB_TOKEN }}
-
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@master
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            type=ref,event=tag
-            type=sha,format=short
-            type=raw,value=latest
+            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push (multi-arch)
+  build:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - short: amd64
+            platform: linux/amd64
+            runs_on: ubuntu-24.04
+          - short: arm64
+            platform: linux/arm64
+            runs_on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - uses: actions/checkout@main
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@master
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request' && env.REGISTRY == 'ghcr.io'
+        uses: docker/login-action@master
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Aliyun CR
+        if: github.event_name != 'pull_request' && env.REGISTRY == 'registry.cn-chengdu.aliyuncs.com'
+        uses: docker/login-action@master
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+
+      - name: Build & push (native ${{ matrix.platform }})
         uses: docker/build-push-action@master
         with:
           context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }} # 原生构建，无 QEMU
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          # 临时标签，用于后续合成 manifest
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.short }}
+          labels: ${{ needs.meta.outputs.labels }}
+          # 官方 runner 用 gha 缓存即可
           cache-from: type=gha
           cache-to: type=gha,version=2,mode=min
+          sbom: true
+          provenance: true
+
+  manifest:
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Login to GHCR
+        if: env.REGISTRY == 'ghcr.io'
+        uses: docker/login-action@master
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Aliyun CR
+        if: env.REGISTRY == 'registry.cn-chengdu.aliyuncs.com'
+        uses: docker/login-action@master
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+
+      - name: Create & push multi-arch manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAGS: ${{ needs.meta.outputs.tags }}
+        run: |
+          set -Eeuxo pipefail
+
+          # 直接把 metadata 的“完整引用”作为 --tag 传入；去掉空行与首尾空白
+          TAG_ARGS=""
+          while IFS= read -r tag; do
+            tag="$(echo "$tag" | xargs)"    # trim
+            [ -z "$tag" ] && continue
+            TAG_ARGS="$TAG_ARGS --tag $tag"
+          done <<< "$TAGS"
+
+          # 合成多架构 manifest（使用两个临时标签作为来源）
+          docker buildx imagetools create \
+            $TAG_ARGS \
+            "$IMAGE:${GITHUB_SHA}-amd64" \
+            "$IMAGE:${GITHUB_SHA}-arm64"
+
+      - name: Inspect (debug)
+        run: |
+          first_tag="$(printf "%s\n" "${{ needs.meta.outputs.tags }}" | head -n1)"
+          docker buildx imagetools inspect "$first_tag"
