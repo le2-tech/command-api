@@ -33,7 +33,7 @@ env:
 
 jobs:
   meta:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
@@ -55,10 +55,10 @@ jobs:
         include:
           - short: amd64
             platform: linux/amd64
-            runs_on: ubuntu-24.04
+            runs_on: ubuntu-26.04
           - short: arm64
             platform: linux/arm64
-            runs_on: ubuntu-24.04-arm
+            runs_on: ubuntu-26.04-arm
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@main
@@ -96,12 +96,12 @@ jobs:
           # 官方 runner 用 gha 缓存即可
           cache-from: type=gha
           cache-to: type=gha,version=2,mode=min
-          sbom: true
-          provenance: true
+          sbom: false
+          provenance: false
 
   manifest:
     needs: [meta, build]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     if: github.event_name != 'pull_request'
     steps:
       - name: Login to GHCR
